@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+ADX(10) / 20-line daily crossover backstudy — sub-$2 stock universe.
+
+Run in an environment with real internet access (GitHub Codespaces, Google
+Cloud Shell, etc.) — NOT inside a restricted sandbox, since it needs to
+reach financialmodelingprep.com directly.
+
+Usage:
+    pip install requests pandas --break-system-packages
+    export FMP_API_KEY="your_key_here"
+    python3 adx_daily_study.py
+
+Optional flags:
+    --price-max 2.0        max share price for the universe (default 2.00)
+    --min-volume 300000     min avg daily volume filter (default 300000)
+    --universe-cap 60        max tickers to pull full history for (default 60)
+    --adx-period 10          ADX lookback period (default 10)
+    --adx-threshold 20       cross level (default 20)
+    --lookback-months 6      crossover detection window (default 6)
+    --timeframe daily        'daily' or 'weekly' (weekly = resampled from daily)
+    --out results.csv        output CSV path
+"""
+
+import os
+import sys
+import time
+import argparse
+from datetime import datetime, timedelta
+
+import requests
+import pandas as pd
+
+FMP_BASE = "https://financialmodelingprep.com/api/v3"
+
+
+def get_api_key():
+    key = os.environ.get("FMP_API_KEY")
+    if not key:
+        sys.exit("Set FMP_API_KEY in your environment first: export FMP_API_KEY=your_key")
+    return key
+
+
+def fetch_screener(api_key, price_max, min_volume, universe_cap):
+    params = {
+        "priceLowerThan": price_max,
+        "priceMoreThan": 0.05,
+        "volumeMoreThan": min_volume,
+        "isActivelyTrading": "true",
+        "exchange": "NYSE,NASDAQ,AMEX",
+        "limit": universe_cap * 3,  # overfetch, we'll trim after sorting
+        "apikey": api_key,
+    }
+    r = requests.get(f"{FMP_BASE}/stock-screener", params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list):
+        sys.exit(f"Unexpected screener response: {data}")
+    # sort by volume descending, keep the most liquid names
+    data.sort(key=lambda d: d.get("volume", 0) or 0, reverse=True)
+    tickers = [d["symbol"] for d in data[:universe_cap]]
+    return tickers
+
+
+def fetch_daily_history(api_key, ticker, months_back):
+    from_date = (datetime.utcnow() - timedelta(days=months_back * 31)).strftime("%Y-%m-%d")
+    to_date = datetime.utcnow().strftime("%Y-%m-%d")
+    params = {"apikey": api_key, "from": from_date, "to": to_date}
+    r = requests.get(f"{FMP_BASE}/historical-price-full/{ticker}", params=params, timeout=30)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    hist = data.get("historical") if isinstance(data, dict) else None
+    if not hist:
+        return None
+    df = pd.DataFrame(hist)
+    if df.empty or not {"date", "high", "low", "close"}.issubset(df.columns):
+        return None
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    return df[["date", "high", "low", "close"]]
+
+
+def resample_weekly(df):
+    df = df.set_index("date")
+    weekly = df.resample("W-FRI").agg({"high": "max", "low": "min", "close": "last"}).dropna()
+    return weekly.reset_index()
+
+
+def wilder_adx(df, period=10):
+    """Standard Wilder ADX. Returns a Series aligned to df.index (NaN until warmed up)."""
+    high, low, close = df["high"].values, df["low"].values, df["close"].values
+    n = len(df)
+    plus_dm = [0.0] * n
+    minus_dm = [0.0] * n
+    tr = [0.0] * n
+    for i in range(1, n):
+        up_move = high[i] - high[i - 1]
+        down_move = low[i - 1] - low[i]
+        plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
+        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
+
+    adx = [None] * n
+    if n < period * 2 + 1:
+        return pd.Series(adx, index=df.index)
+
+    sm_tr = sum(tr[1:period + 1])
+    sm_p = sum(plus_dm[1:period + 1])
+    sm_m = sum(minus_dm[1:period + 1])
+
+    dxs = []
+    def dx_from(sm_tr, sm_p, sm_m):
+        pdi = 100 * sm_p / sm_tr if sm_tr else 0
+        mdi = 100 * sm_m / sm_tr if sm_tr else 0
+        return 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0
+
+    dxs.append(dx_from(sm_tr, sm_p, sm_m))
+    dx_index = [period]  # bar index in original df that dxs[0] corresponds to
+
+    for i in range(period + 1, n):
+        sm_tr = sm_tr - sm_tr / period + tr[i]
+        sm_p = sm_p - sm_p / period + plus_dm[i]
+        sm_m = sm_m - sm_m / period + minus_dm[i]
+        dxs.append(dx_from(sm_tr, sm_p, sm_m))
+        dx_index.append(i)
+
+    if len(dxs) < period:
+        return pd.Series(adx, index=df.index)
+
+    adx_val = sum(dxs[:period]) / period
+    adx[dx_index[period - 1]] = adx_val
+    for i in range(period, len(dxs)):
+        adx_val = (adx_val * (period - 1) + dxs[i]) / period
+        adx[dx_index[i]] = adx_val
+
+    return pd.Series(adx, index=df.index)
+
+
+def find_crossovers(df, adx_series, threshold, lookback_months):
+    cutoff = datetime.utcnow() - timedelta(days=lookback_months * 31)
+    events = []
+    prev = None
+    for i in range(len(df)):
+        val = adx_series.iloc[i]
+        if val is None:
+            prev = None
+            continue
+        if prev is not None and prev < threshold <= val:
+            d = df["date"].iloc[i]
+            if d.to_pydatetime() >= cutoff:
+                events.append({"date": d, "adx": val, "price": df["close"].iloc[i]})
+        prev = val
+    return events
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--price-max", type=float, default=2.0)
+    ap.add_argument("--min-volume", type=int, default=300000)
+    ap.add_argument("--universe-cap", type=int, default=60)
+    ap.add_argument("--adx-period", type=int, default=10)
+    ap.add_argument("--adx-threshold", type=float, default=20.0)
+    ap.add_argument("--lookback-months", type=int, default=6)
+    ap.add_argument("--timeframe", choices=["daily", "weekly"], default="daily")
+    ap.add_argument("--out", default="adx_crossover_results.csv")
+    args = ap.parse_args()
+
+    api_key = get_api_key()
+
+    print(f"Screening: price < ${args.price_max}, avg volume > {args.min_volume:,}, actively trading...")
+    tickers = fetch_screener(api_key, args.price_max, args.min_volume, args.universe_cap)
+    print(f"Universe: {len(tickers)} tickers -> {', '.join(tickers)}")
+
+    history_months = args.lookback_months + 3  # buffer for ADX warmup
+
+    rows = []
+    for i, ticker in enumerate(tickers):
+        try:
+            df = fetch_daily_history(api_key, ticker, history_months)
+            if df is None or len(df) < args.adx_period * 2 + 5:
+                print(f"  [{i+1}/{len(tickers)}] {ticker}: insufficient data, skipped")
+                continue
+            if args.timeframe == "weekly":
+                df = resample_weekly(df)
+            adx_series = wilder_adx(df, period=args.adx_period)
+            events = find_crossovers(df, adx_series, args.adx_threshold, args.lookback_months)
+            if not events:
+                print(f"  [{i+1}/{len(tickers)}] {ticker}: no cross in window")
+                continue
+            last_event = events[-1]  # most recent qualifying cross
+            current_price = df["close"].iloc[-1]
+            current_adx = adx_series.iloc[-1]
+            ret_pct = (current_price - last_event["price"]) / last_event["price"] * 100
+            rows.append({
+                "ticker": ticker,
+                "cross_date": last_event["date"].strftime("%Y-%m-%d"),
+                "price_at_cross": round(last_event["price"], 3),
+                "adx_at_cross": round(last_event["adx"], 1),
+                "current_price": round(current_price, 3),
+                "current_adx": round(current_adx, 1) if current_adx else None,
+                "return_pct_since_cross": round(ret_pct, 1),
+            })
+            print(f"  [{i+1}/{len(tickers)}] {ticker}: CROSS {last_event['date'].date()} @ ${last_event['price']:.2f}, "
+                  f"ADX {last_event['adx']:.1f} -> now ${current_price:.2f} ({ret_pct:+.1f}%)")
+        except Exception as e:
+            print(f"  [{i+1}/{len(tickers)}] {ticker}: error - {e}")
+        time.sleep(0.25)  # be polite to the free-tier rate limit
+
+    if not rows:
+        print("\nNo qualifying crossovers found in this universe/window.")
+        return
+
+    out_df = pd.DataFrame(rows).sort_values("return_pct_since_cross", ascending=False)
+    out_df.to_csv(args.out, index=False)
+
+    print(f"\n{len(rows)} tickers with a qualifying ADX({args.adx_period}) cross above "
+          f"{args.adx_threshold} in the last {args.lookback_months} months.")
+    print(f"Avg return since cross: {out_df['return_pct_since_cross'].mean():.1f}%")
+    print(f"Win rate: {(out_df['return_pct_since_cross'] > 0).mean() * 100:.0f}%")
+    print(f"Full results written to {args.out}")
+    print(out_df.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
