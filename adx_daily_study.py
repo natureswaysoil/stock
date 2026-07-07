@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+ADX(10) / 20-line daily crossover backstudy — sub-$2 stock universe.
+Uses yfinance (free, keyless, no daily quota) for both the screener and
+daily OHLCV history. No FMP dependency.
+
+Usage:
+    pip install yfinance pandas --break-system-packages
+    python3 adx_daily_study.py
+"""
+
+import sys
+import time
+import argparse
+from datetime import datetime, timedelta, UTC
+
+import pandas as pd
+import yfinance as yf
+from yfinance import EquityQuery
+
+
+def fetch_screener(price_max, price_min, min_volume, universe_cap):
+    query = EquityQuery("and", [
+        EquityQuery("eq", ["region", "us"]),
+        EquityQuery("lt", ["intradayprice", price_max]),
+        EquityQuery("gt", ["intradayprice", price_min]),
+        EquityQuery("gt", ["avgdailyvol3m", min_volume]),
+    ])
+    result = yf.screen(query, size=universe_cap, sortField="avgdailyvol3m", sortAsc=False)
+    quotes = result.get("quotes", [])
+    if not quotes:
+        quotes = result.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+    tickers = [q["symbol"] for q in quotes if "symbol" in q]
+    return tickers
+
+
+def fetch_daily_history(ticker, months_back):
+    period_days = months_back * 31
+    df = yf.Ticker(ticker).history(period=f"{period_days}d", interval="1d", auto_adjust=True)
+    if df is None or df.empty:
+        return None
+    df = df.reset_index()
+    df = df.rename(columns={"Date": "date", "High": "high", "Low": "low", "Close": "close"})
+    if not {"date", "high", "low", "close"}.issubset(df.columns):
+        return None
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+    df = df.sort_values("date").reset_index(drop=True)
+    return df[["date", "high", "low", "close"]]
+
+
+def resample_weekly(df):
+    df = df.set_index("date")
+    weekly = df.resample("W-FRI").agg({"high": "max", "low": "min", "close": "last"}).dropna()
+    return weekly.reset_index()
+
+
+def wilder_adx(df, period=10):
+    """Standard Wilder ADX, +DI, -DI. Each returned as a list aligned to df rows
+    (None until warmed up)."""
+    high, low, close = df["high"].values, df["low"].values, df["close"].values
+    n = len(df)
+    plus_dm = [0.0] * n
+    minus_dm = [0.0] * n
+    tr = [0.0] * n
+    for i in range(1, n):
+        up_move = high[i] - high[i - 1]
+        down_move = low[i - 1] - low[i]
+        plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
+        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
+
+    adx = [None] * n
+    plus_di = [None] * n
+    minus_di = [None] * n
+    if n < period * 2 + 1:
+        return adx, plus_di, minus_di
+
+    sm_tr = sum(tr[1:period + 1])
+    sm_p = sum(plus_dm[1:period + 1])
+    sm_m = sum(minus_dm[1:period + 1])
+
+    dxs = []
+    di_pairs = []  # (plus_di, minus_di) aligned with dxs
+    def dx_from(sm_tr, sm_p, sm_m):
+        pdi = 100 * sm_p / sm_tr if sm_tr else 0
+        mdi = 100 * sm_m / sm_tr if sm_tr else 0
+        dx = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0
+        return dx, pdi, mdi
+
+    dx, pdi, mdi = dx_from(sm_tr, sm_p, sm_m)
+    dxs.append(dx)
+    di_pairs.append((pdi, mdi))
+    dx_index = [period]
+
+    for i in range(period + 1, n):
+        sm_tr = sm_tr - sm_tr / period + tr[i]
+        sm_p = sm_p - sm_p / period + plus_dm[i]
+        sm_m = sm_m - sm_m / period + minus_dm[i]
+        dx, pdi, mdi = dx_from(sm_tr, sm_p, sm_m)
+        dxs.append(dx)
+        di_pairs.append((pdi, mdi))
+        dx_index.append(i)
+
+    if len(dxs) < period:
+        return adx, plus_di, minus_di
+
+    adx_val = sum(dxs[:period]) / period
+    adx[dx_index[period - 1]] = adx_val
+    plus_di[dx_index[period - 1]] = di_pairs[period - 1][0]
+    minus_di[dx_index[period - 1]] = di_pairs[period - 1][1]
+    for i in range(period, len(dxs)):
+        adx_val = (adx_val * (period - 1) + dxs[i]) / period
+        adx[dx_index[i]] = adx_val
+        plus_di[dx_index[i]] = di_pairs[i][0]
+        minus_di[dx_index[i]] = di_pairs[i][1]
+
+    return adx, plus_di, minus_di
+
+
+def find_crossovers(df, adx_list, plus_di, minus_di, threshold, lookback_months,
+                     require_uptrend=True, plus_di_min=0.0, plus_di_max=999.0):
+    cutoff = datetime.now(UTC) - timedelta(days=lookback_months * 31)
+    events = []
+    prev = None
+    for i in range(len(df)):
+        val = adx_list[i]
+        if val is None:
+            prev = None
+            continue
+        if prev is not None and prev < threshold <= val:
+            is_uptrend = (plus_di[i] is not None and minus_di[i] is not None
+                          and plus_di[i] > minus_di[i])
+            in_band = (plus_di[i] is not None and plus_di_min <= plus_di[i] <= plus_di_max)
+            if ((not require_uptrend) or is_uptrend) and in_band:
+                d = df["date"].iloc[i]
+                d_naive = d.to_pydatetime()
+                if d_naive.tzinfo is not None:
+                    d_naive = d_naive.replace(tzinfo=None)
+                cutoff_naive = cutoff.replace(tzinfo=None)
+                if d_naive >= cutoff_naive:
+                    events.append({
+                        "date": d, "adx": val, "price": df["close"].iloc[i],
+                        "plus_di": plus_di[i], "minus_di": minus_di[i],
+                    })
+        prev = val
+    return events
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--price-max", type=float, default=2.0)
+    ap.add_argument("--price-min", type=float, default=0.10)
+    ap.add_argument("--min-volume", type=int, default=300000)
+    ap.add_argument("--universe-cap", type=int, default=60)
+    ap.add_argument("--adx-period", type=int, default=10)
+    ap.add_argument("--adx-threshold", type=float, default=20.0)
+    ap.add_argument("--lookback-months", type=int, default=6)
+    ap.add_argument("--timeframe", choices=["daily", "weekly"], default="daily")
+    ap.add_argument("--no-uptrend-filter", action="store_true",
+                     help="Count all ADX crosses, not just ones where +DI > -DI")
+    ap.add_argument("--plus-di-min", type=float, default=0.0,
+                     help="Only count crosses where +DI at cross is >= this value")
+    ap.add_argument("--plus-di-max", type=float, default=999.0,
+                     help="Only count crosses where +DI at cross is <= this value")
+    ap.add_argument("--out", default="adx_crossover_results.csv")
+    args = ap.parse_args()
+    require_uptrend = not args.no_uptrend_filter
+
+    print(f"Screening: ${args.price_min} < price < ${args.price_max}, "
+          f"avg 3mo volume > {args.min_volume:,}, US region...")
+    tickers = fetch_screener(args.price_max, args.price_min, args.min_volume, args.universe_cap)
+    if not tickers:
+        sys.exit("Screener returned no tickers — check yfinance version supports yf.screen/EquityQuery (pip install -U yfinance).")
+    print(f"Universe: {len(tickers)} tickers -> {', '.join(tickers)}")
+    print(f"Direction filter: {'ON (+DI > -DI required, i.e. uptrend only)' if require_uptrend else 'OFF (all crosses counted)'}")
+    print(f"+DI band: {args.plus_di_min} - {args.plus_di_max}")
+
+    history_months = args.lookback_months + 3
+
+    rows = []
+    for i, ticker in enumerate(tickers):
+        try:
+            df = fetch_daily_history(ticker, history_months)
+            if df is None or len(df) < args.adx_period * 2 + 5:
+                print(f"  [{i+1}/{len(tickers)}] {ticker}: insufficient data, skipped")
+                continue
+            if args.timeframe == "weekly":
+                df = resample_weekly(df)
+            adx_list, plus_di, minus_di = wilder_adx(df, period=args.adx_period)
+            events = find_crossovers(df, adx_list, plus_di, minus_di, args.adx_threshold,
+                                      args.lookback_months, require_uptrend=require_uptrend,
+                                      plus_di_min=args.plus_di_min, plus_di_max=args.plus_di_max)
+            if not events:
+                print(f"  [{i+1}/{len(tickers)}] {ticker}: no qualifying cross in window")
+                continue
+            last_event = events[-1]
+            current_price = df["close"].iloc[-1]
+            current_adx = adx_list[-1]
+            ret_pct = (current_price - last_event["price"]) / last_event["price"] * 100
+            rows.append({
+                "ticker": ticker,
+                "cross_date": last_event["date"].strftime("%Y-%m-%d"),
+                "price_at_cross": round(last_event["price"], 3),
+                "adx_at_cross": round(last_event["adx"], 1),
+                "plus_di_at_cross": round(last_event["plus_di"], 1),
+                "minus_di_at_cross": round(last_event["minus_di"], 1),
+                "current_price": round(current_price, 3),
+                "current_adx": round(current_adx, 1) if current_adx else None,
+                "return_pct_since_cross": round(ret_pct, 1),
+            })
+            print(f"  [{i+1}/{len(tickers)}] {ticker}: CROSS {last_event['date'].date()} @ ${last_event['price']:.2f}, "
+                  f"ADX {last_event['adx']:.1f} (+DI {last_event['plus_di']:.1f} / -DI {last_event['minus_di']:.1f}) "
+                  f"-> now ${current_price:.2f} ({ret_pct:+.1f}%)")
+        except Exception as e:
+            print(f"  [{i+1}/{len(tickers)}] {ticker}: error - {e}")
+        time.sleep(0.15)
+
+    if not rows:
+        print("\nNo qualifying crossovers found in this universe/window.")
+        return
+
+    out_df = pd.DataFrame(rows).sort_values("return_pct_since_cross", ascending=False)
+    out_df.to_csv(args.out, index=False)
+
+    print(f"\n{len(rows)} tickers with a qualifying ADX({args.adx_period}) cross above "
+          f"{args.adx_threshold} in the last {args.lookback_months} months.")
+    print(f"Avg return since cross: {out_df['return_pct_since_cross'].mean():.1f}%")
+    print(f"Win rate: {(out_df['return_pct_since_cross'] > 0).mean() * 100:.0f}%")
+    print(f"Full results written to {args.out}")
+    print(out_df.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
