@@ -54,6 +54,28 @@ def resample_weekly(df):
     return weekly.reset_index()
 
 
+def resample_monthly(df):
+    """Convert daily OHLC data into completed calendar-month bars."""
+    monthly = (
+        df.set_index("date")
+        .resample("ME")
+        .agg({"high": "max", "low": "min", "close": "last"})
+        .dropna()
+    )
+    return monthly.reset_index()
+
+
+def history_months_for(timeframe, lookback_months, adx_period):
+    """Return enough daily history to warm up ADX on the selected bars."""
+    baseline = lookback_months + 3
+    if timeframe == "weekly":
+        warmup_months = ((adx_period * 2 + 5) * 7 + 30) // 31
+        return max(baseline, warmup_months + lookback_months)
+    if timeframe == "monthly":
+        return max(baseline, adx_period * 2 + lookback_months + 6)
+    return baseline
+
+
 def wilder_adx(df, period=10):
     """Standard Wilder ADX, +DI, -DI. Each returned as a list aligned to df rows
     (None until warmed up)."""
@@ -146,7 +168,7 @@ def find_crossovers(df, adx_list, plus_di, minus_di, threshold, lookback_months,
     return events
 
 
-def main():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--price-max", type=float, default=2.0)
     ap.add_argument("--price-min", type=float, default=0.10)
@@ -155,7 +177,12 @@ def main():
     ap.add_argument("--adx-period", type=int, default=10)
     ap.add_argument("--adx-threshold", type=float, default=20.0)
     ap.add_argument("--lookback-months", type=int, default=6)
-    ap.add_argument("--timeframe", choices=["daily", "weekly"], default="daily")
+    ap.add_argument(
+        "--timeframe",
+        choices=["daily", "weekly", "monthly"],
+        default="monthly",
+        help="OHLC bar timeframe used by the study (default: monthly)",
+    )
     ap.add_argument("--no-uptrend-filter", action="store_true",
                      help="Count all ADX crosses, not just ones where +DI > -DI")
     ap.add_argument("--plus-di-min", type=float, default=0.0,
@@ -163,7 +190,11 @@ def main():
     ap.add_argument("--plus-di-max", type=float, default=999.0,
                      help="Only count crosses where +DI at cross is <= this value")
     ap.add_argument("--out", default="adx_crossover_results.csv")
-    args = ap.parse_args()
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     require_uptrend = not args.no_uptrend_filter
 
     print(f"Screening: ${args.price_min} < price < ${args.price_max}, "
@@ -174,8 +205,9 @@ def main():
     print(f"Universe: {len(tickers)} tickers -> {', '.join(tickers)}")
     print(f"Direction filter: {'ON (+DI > -DI required, i.e. uptrend only)' if require_uptrend else 'OFF (all crosses counted)'}")
     print(f"+DI band: {args.plus_di_min} - {args.plus_di_max}")
+    print(f"Chart timeframe: {args.timeframe}")
 
-    history_months = args.lookback_months + 3
+    history_months = history_months_for(args.timeframe, args.lookback_months, args.adx_period)
 
     rows = []
     for i, ticker in enumerate(tickers):
@@ -186,6 +218,14 @@ def main():
                 continue
             if args.timeframe == "weekly":
                 df = resample_weekly(df)
+            elif args.timeframe == "monthly":
+                df = resample_monthly(df)
+            if len(df) < args.adx_period * 2 + 1:
+                print(
+                    f"  [{i+1}/{len(tickers)}] {ticker}: insufficient "
+                    f"{args.timeframe} bars ({len(df)}), skipped"
+                )
+                continue
             adx_list, plus_di, minus_di = wilder_adx(df, period=args.adx_period)
             events = find_crossovers(df, adx_list, plus_di, minus_di, args.adx_threshold,
                                       args.lookback_months, require_uptrend=require_uptrend,
@@ -199,6 +239,7 @@ def main():
             ret_pct = (current_price - last_event["price"]) / last_event["price"] * 100
             rows.append({
                 "ticker": ticker,
+                "timeframe": args.timeframe,
                 "cross_date": last_event["date"].strftime("%Y-%m-%d"),
                 "price_at_cross": round(last_event["price"], 3),
                 "adx_at_cross": round(last_event["adx"], 1),
