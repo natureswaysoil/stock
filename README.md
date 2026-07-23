@@ -34,7 +34,16 @@ python .\adx_daily_study.py --timeframe daily
 ```
 
 Results are written to `adx_crossover_results.csv` unless `--out` specifies
-another path.
+another path. When the scan has results, the CSV is also emailed to
+`natureswaysoil@gmail.com` using the Windows-encrypted credential at
+`%USERPROFILE%\.stock-email-credential.xml`. When no qualifying stocks are
+found, no email is sent.
+
+To write the CSV without emailing it:
+
+```powershell
+python .\adx_daily_study.py --no-email
+```
 
 ## Validate
 
