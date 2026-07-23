@@ -1,4 +1,7 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -6,6 +9,7 @@ from adx_daily_study import (
     history_months_for,
     parse_args,
     resample_monthly,
+    send_results_email,
 )
 
 
@@ -40,6 +44,42 @@ class MonthlyTimeframeTests(unittest.TestCase):
 
     def test_monthly_history_includes_adx_warmup(self):
         self.assertGreaterEqual(history_months_for("monthly", 6, 10), 32)
+
+    @patch("adx_daily_study.subprocess.run")
+    def test_empty_results_send_nothing(self, run):
+        sent = send_results_email(
+            "missing.csv",
+            "natureswaysoil@gmail.com",
+            "missing.xml",
+            "monthly",
+            0,
+        )
+
+        self.assertFalse(sent)
+        run.assert_not_called()
+
+    @patch("adx_daily_study.subprocess.run")
+    def test_nonempty_results_use_encrypted_credential_helper(self, run):
+        run.return_value.stdout = "Results emailed"
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "results.csv"
+            credential_path = Path(temp_dir) / "credential.xml"
+            csv_path.write_text("ticker,timeframe\nTEST,monthly\n", encoding="utf-8")
+            credential_path.write_text("encrypted", encoding="utf-8")
+
+            sent = send_results_email(
+                csv_path,
+                "natureswaysoil@gmail.com",
+                credential_path,
+                "monthly",
+                1,
+            )
+
+        self.assertTrue(sent)
+        command = run.call_args.args[0]
+        self.assertIn("-NonInteractive", command)
+        self.assertIn("natureswaysoil@gmail.com", command)
+        self.assertNotIn("password", " ".join(command).lower())
 
 
 if __name__ == "__main__":

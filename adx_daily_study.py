@@ -12,7 +12,10 @@ Usage:
 import sys
 import time
 import argparse
+import os
+import subprocess
 from datetime import datetime, timedelta, UTC
+from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
@@ -74,6 +77,62 @@ def history_months_for(timeframe, lookback_months, adx_period):
     if timeframe == "monthly":
         return max(baseline, adx_period * 2 + lookback_months + 6)
     return baseline
+
+
+def send_results_email(csv_path, recipient, credential_path, timeframe, row_count):
+    """Send a non-empty CSV through Gmail without exposing its App Password."""
+    if row_count <= 0:
+        return False
+
+    csv_file = Path(csv_path).resolve()
+    credential_file = Path(credential_path).expanduser().resolve()
+    mailer = Path(__file__).with_name("send_results_email.ps1").resolve()
+
+    if not csv_file.is_file():
+        raise FileNotFoundError(f"Results file not found: {csv_file}")
+    if not credential_file.is_file():
+        raise FileNotFoundError(
+            f"Encrypted email credential not found: {credential_file}"
+        )
+    if not mailer.is_file():
+        raise FileNotFoundError(f"Email helper not found: {mailer}")
+
+    powershell = os.environ.get(
+        "POWERSHELL_EXE",
+        "powershell.exe" if sys.platform == "win32" else "pwsh",
+    )
+    subject = f"Stock ADX results: {row_count} monthly-chart match(es)"
+    body = (
+        f"The {timeframe} ADX stock scan found {row_count} qualifying "
+        "match(es). The complete CSV is attached."
+    )
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(mailer),
+            "-CredentialPath",
+            str(credential_file),
+            "-Recipient",
+            recipient,
+            "-CsvPath",
+            str(csv_file),
+            "-Subject",
+            subject,
+            "-Body",
+            body,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if completed.stdout.strip():
+        print(completed.stdout.strip())
+    return True
 
 
 def wilder_adx(df, period=10):
@@ -190,6 +249,24 @@ def parse_args(argv=None):
     ap.add_argument("--plus-di-max", type=float, default=999.0,
                      help="Only count crosses where +DI at cross is <= this value")
     ap.add_argument("--out", default="adx_crossover_results.csv")
+    ap.add_argument(
+        "--email-to",
+        default=os.environ.get("STOCK_EMAIL_TO", "natureswaysoil@gmail.com"),
+        help="Email recipient for non-empty results",
+    )
+    ap.add_argument(
+        "--email-credential",
+        default=os.environ.get(
+            "STOCK_EMAIL_CREDENTIAL",
+            str(Path.home() / ".stock-email-credential.xml"),
+        ),
+        help="Windows-encrypted PowerShell credential created with Export-Clixml",
+    )
+    ap.add_argument(
+        "--no-email",
+        action="store_true",
+        help="Write results without sending email",
+    )
     return ap.parse_args(argv)
 
 
@@ -269,7 +346,25 @@ def main(argv=None):
     print(f"Win rate: {(out_df['return_pct_since_cross'] > 0).mean() * 100:.0f}%")
     print(f"Full results written to {args.out}")
     print(out_df.to_string(index=False))
+    if not args.no_email:
+        try:
+            send_results_email(
+                args.out,
+                args.email_to,
+                args.email_credential,
+                args.timeframe,
+                len(rows),
+            )
+        except Exception as exc:
+            print(f"Email delivery failed: {exc}", file=sys.stderr)
+            print(
+                "The CSV was saved successfully. Use --no-email to disable "
+                "delivery or repair the stored credential.",
+                file=sys.stderr,
+            )
+            return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
