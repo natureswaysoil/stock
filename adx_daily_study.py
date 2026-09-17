@@ -138,6 +138,7 @@ def send_results_email(csv_path, recipient, sender, api_key, timeframe, row_coun
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "User-Agent": "natureswaysoil-stock-scanner/1.0",
             "Idempotency-Key": hashlib.sha256(
                 recipient.encode("utf-8") + timeframe.encode("utf-8") + csv_bytes
             ).hexdigest(),

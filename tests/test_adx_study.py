@@ -115,6 +115,7 @@ class MonthlyTimeframeTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(payload["attachments"][0]["content"]),
                          b"ticker,timeframe\nTEST,monthly\n")
         self.assertEqual(request.headers["Authorization"], "Bearer re_secret_test_key")
+        self.assertEqual(request.headers["User-agent"], "natureswaysoil-stock-scanner/1.0")
 
     def test_resend_requires_configuration(self):
         with TemporaryDirectory() as temp_dir:

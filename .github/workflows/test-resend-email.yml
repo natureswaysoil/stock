@@ -1,4 +1,5 @@
 name: Test Resend email
+# Pushes that change this verification workflow run one delivery test.
 
 on:
   workflow_dispatch:
