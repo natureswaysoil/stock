@@ -40,14 +40,24 @@ LOOKBACK_MONTHS = 6
 HISTORY_MONTHS = LOOKBACK_MONTHS + 3
 
 
-def fetch_screener():
+def fetch_screener(retries=3):
     query = EquityQuery("and", [
         EquityQuery("eq", ["region", "us"]),
         EquityQuery("lt", ["intradayprice", PRICE_MAX]),
         EquityQuery("gt", ["intradayprice", PRICE_MIN]),
         EquityQuery("gt", ["avgdailyvol3m", MIN_VOLUME]),
     ])
-    result = yf.screen(query, size=UNIVERSE_CAP, sortField="avgdailyvol3m", sortAsc=False)
+    for attempt in range(retries):
+        try:
+            result = yf.screen(
+                query, size=UNIVERSE_CAP,
+                sortField="avgdailyvol3m", sortAsc=False,
+            )
+            break
+        except Exception:
+            if attempt + 1 == retries:
+                raise
+            time.sleep(2 ** attempt)
     quotes = result.get("quotes", [])
     if not quotes:
         quotes = result.get("finance", {}).get("result", [{}])[0].get("quotes", [])
@@ -177,6 +187,7 @@ def build_signals(df):
 
 
 def main():
+    print("NOTE: This is a retrospective study of today's screened universe, not a point-in-time universe backtest.")
     print(f"Screening: ${PRICE_MIN} < price < ${PRICE_MAX}, avg 3mo volume > {MIN_VOLUME:,}, US region...")
     tickers = fetch_screener()
     if not tickers:
@@ -204,15 +215,19 @@ def main():
                 if not hits:
                     continue
                 last_hit = hits[-1]
-                price_then = df["close"].iloc[last_hit]
-                if price_then == 0:
+                entry_idx = last_hit + 1
+                if entry_idx >= len(df):
+                    continue
+                price_then = df["open"].iloc[entry_idx]
+                if price_then <= 0:
                     continue
                 ret = (current_price - price_then) / price_then * 100
                 results.setdefault(name, []).append(ret)
                 per_ticker_rows.append({
                     "ticker": ticker, "indicator": name,
                     "signal_date": df["date"].iloc[last_hit].strftime("%Y-%m-%d"),
-                    "price_then": round(price_then, 3),
+                    "entry_date": df["date"].iloc[entry_idx].strftime("%Y-%m-%d"),
+                    "entry_price": round(price_then, 3),
                     "price_now": round(current_price, 3),
                     "return_pct": round(ret, 1),
                 })

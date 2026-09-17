@@ -13,7 +13,11 @@ import sys
 import time
 import argparse
 import os
-import subprocess
+import base64
+import hashlib
+import json
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
@@ -22,14 +26,24 @@ import yfinance as yf
 from yfinance import EquityQuery
 
 
-def fetch_screener(price_max, price_min, min_volume, universe_cap):
+def fetch_screener(price_max, price_min, min_volume, universe_cap, retries=3):
     query = EquityQuery("and", [
         EquityQuery("eq", ["region", "us"]),
         EquityQuery("lt", ["intradayprice", price_max]),
         EquityQuery("gt", ["intradayprice", price_min]),
         EquityQuery("gt", ["avgdailyvol3m", min_volume]),
     ])
-    result = yf.screen(query, size=universe_cap, sortField="avgdailyvol3m", sortAsc=False)
+    for attempt in range(retries):
+        try:
+            result = yf.screen(
+                query, size=universe_cap,
+                sortField="avgdailyvol3m", sortAsc=False,
+            )
+            break
+        except Exception:
+            if attempt + 1 == retries:
+                raise
+            time.sleep(2 ** attempt)
     quotes = result.get("quotes", [])
     if not quotes:
         quotes = result.get("finance", {}).get("result", [{}])[0].get("quotes", [])
@@ -43,28 +57,38 @@ def fetch_daily_history(ticker, months_back):
     if df is None or df.empty:
         return None
     df = df.reset_index()
-    df = df.rename(columns={"Date": "date", "High": "high", "Low": "low", "Close": "close"})
-    if not {"date", "high", "low", "close"}.issubset(df.columns):
+    df = df.rename(columns={"Date": "date", "Open": "open", "High": "high", "Low": "low", "Close": "close"})
+    if not {"date", "open", "high", "low", "close"}.issubset(df.columns):
         return None
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
     df = df.sort_values("date").reset_index(drop=True)
-    return df[["date", "high", "low", "close"]]
+    return df[["date", "open", "high", "low", "close"]]
 
 
-def resample_weekly(df):
+def resample_weekly(df, as_of=None):
+    """Convert daily data into completed Friday-ending weekly bars."""
+    as_of = pd.Timestamp(as_of or datetime.now(UTC)).tz_localize(None).normalize()
     df = df.set_index("date")
-    weekly = df.resample("W-FRI").agg({"high": "max", "low": "min", "close": "last"}).dropna()
+    aggregation = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    aggregation = {key: value for key, value in aggregation.items() if key in df.columns}
+    weekly = df.resample("W-FRI").agg(aggregation).dropna()
+    weekly = weekly[weekly.index < as_of]
     return weekly.reset_index()
 
 
-def resample_monthly(df):
+def resample_monthly(df, as_of=None):
     """Convert daily OHLC data into completed calendar-month bars."""
+    as_of = pd.Timestamp(as_of or datetime.now(UTC)).tz_localize(None).normalize()
+    current_month_start = as_of.to_period("M").start_time
+    aggregation = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    aggregation = {key: value for key, value in aggregation.items() if key in df.columns}
     monthly = (
         df.set_index("date")
         .resample("ME")
-        .agg({"high": "max", "low": "min", "close": "last"})
+        .agg(aggregation)
         .dropna()
     )
+    monthly = monthly[monthly.index < current_month_start]
     return monthly.reset_index()
 
 
@@ -79,59 +103,57 @@ def history_months_for(timeframe, lookback_months, adx_period):
     return baseline
 
 
-def send_results_email(csv_path, recipient, credential_path, timeframe, row_count):
-    """Send a non-empty CSV through Gmail without exposing its App Password."""
+def send_results_email(csv_path, recipient, sender, api_key, timeframe, row_count):
+    """Send a non-empty CSV through Resend's HTTPS API."""
     if row_count <= 0:
         return False
 
     csv_file = Path(csv_path).resolve()
-    credential_file = Path(credential_path).expanduser().resolve()
-    mailer = Path(__file__).with_name("send_results_email.ps1").resolve()
-
     if not csv_file.is_file():
         raise FileNotFoundError(f"Results file not found: {csv_file}")
-    if not credential_file.is_file():
-        raise FileNotFoundError(
-            f"Encrypted email credential not found: {credential_file}"
-        )
-    if not mailer.is_file():
-        raise FileNotFoundError(f"Email helper not found: {mailer}")
+    if not api_key:
+        raise ValueError("RESEND_API_KEY is required for email delivery")
+    if not sender:
+        raise ValueError("STOCK_EMAIL_FROM is required for email delivery")
 
-    powershell = os.environ.get(
-        "POWERSHELL_EXE",
-        "powershell.exe" if sys.platform == "win32" else "pwsh",
-    )
-    subject = f"Stock ADX results: {row_count} monthly-chart match(es)"
+    subject = f"Stock ADX results: {row_count} {timeframe}-chart match(es)"
     body = (
         f"The {timeframe} ADX stock scan found {row_count} qualifying "
         "match(es). The complete CSV is attached."
     )
-    completed = subprocess.run(
-        [
-            powershell,
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(mailer),
-            "-CredentialPath",
-            str(credential_file),
-            "-Recipient",
-            recipient,
-            "-CsvPath",
-            str(csv_file),
-            "-Subject",
-            subject,
-            "-Body",
-            body,
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    csv_bytes = csv_file.read_bytes()
+    payload = {
+        "from": sender,
+        "to": [recipient],
+        "subject": subject,
+        "text": body,
+        "attachments": [{
+            "filename": csv_file.name,
+            "content": base64.b64encode(csv_bytes).decode("ascii"),
+        }],
+    }
+    request = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Idempotency-Key": hashlib.sha256(
+                recipient.encode("utf-8") + timeframe.encode("utf-8") + csv_bytes
+            ).hexdigest(),
+        },
+        method="POST",
     )
-    if completed.stdout.strip():
-        print(completed.stdout.strip())
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Resend API returned HTTP {exc.code}: {detail}") from exc
+    message_id = result.get("id")
+    if not message_id:
+        raise RuntimeError(f"Resend API did not return a message ID: {result}")
+    print(f"Results accepted by Resend for {recipient} (message {message_id})")
     return True
 
 
@@ -254,25 +276,50 @@ def parse_args(argv=None):
         default=os.environ.get("STOCK_EMAIL_TO", "natureswaysoil@gmail.com"),
         help="Email recipient for non-empty results",
     )
+    ap.add_argument("--email-from", default=os.environ.get("STOCK_EMAIL_FROM"),
+                    help="Verified Resend sender, e.g. Stock Scanner <stocks@example.com>")
     ap.add_argument(
-        "--email-credential",
-        default=os.environ.get(
-            "STOCK_EMAIL_CREDENTIAL",
-            str(Path.home() / ".stock-email-credential.xml"),
-        ),
-        help="Windows-encrypted PowerShell credential created with Export-Clixml",
+        "--test-email",
+        action="store_true",
+        help="Send a small Resend verification CSV and exit without screening stocks",
     )
     ap.add_argument(
         "--no-email",
         action="store_true",
         help="Write results without sending email",
     )
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if args.price_min < 0 or args.price_max <= args.price_min:
+        ap.error("--price-max must be greater than --price-min, and prices cannot be negative")
+    if args.min_volume < 0 or args.universe_cap < 1:
+        ap.error("--min-volume cannot be negative and --universe-cap must be at least 1")
+    if args.adx_period < 1 or args.lookback_months < 1:
+        ap.error("--adx-period and --lookback-months must be at least 1")
+    if args.plus_di_min > args.plus_di_max:
+        ap.error("--plus-di-min cannot exceed --plus-di-max")
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
     require_uptrend = not args.no_uptrend_filter
+
+    if args.test_email:
+        test_path = Path(args.out)
+        pd.DataFrame([{
+            "status": "ok",
+            "message": "Resend email delivery verification",
+            "created_utc": datetime.now(UTC).isoformat(),
+        }]).to_csv(test_path, index=False)
+        send_results_email(
+            test_path,
+            args.email_to,
+            args.email_from,
+            os.environ.get("RESEND_API_KEY"),
+            "test",
+            1,
+        )
+        return 0
 
     print(f"Screening: ${args.price_min} < price < ${args.price_max}, "
           f"avg 3mo volume > {args.min_volume:,}, US region...")
@@ -289,10 +336,11 @@ def main(argv=None):
     rows = []
     for i, ticker in enumerate(tickers):
         try:
-            df = fetch_daily_history(ticker, history_months)
-            if df is None or len(df) < args.adx_period * 2 + 5:
+            daily_df = fetch_daily_history(ticker, history_months)
+            if daily_df is None or len(daily_df) < args.adx_period * 2 + 5:
                 print(f"  [{i+1}/{len(tickers)}] {ticker}: insufficient data, skipped")
                 continue
+            df = daily_df
             if args.timeframe == "weekly":
                 df = resample_weekly(df)
             elif args.timeframe == "monthly":
@@ -311,19 +359,29 @@ def main(argv=None):
                 print(f"  [{i+1}/{len(tickers)}] {ticker}: no qualifying cross in window")
                 continue
             last_event = events[-1]
-            current_price = df["close"].iloc[-1]
+            current_price = daily_df["close"].iloc[-1]
             current_adx = adx_list[-1]
-            ret_pct = (current_price - last_event["price"]) / last_event["price"] * 100
+            entry_rows = daily_df[daily_df["date"] > last_event["date"]]
+            if entry_rows.empty:
+                print(f"  [{i+1}/{len(tickers)}] {ticker}: signal has no subsequent entry bar")
+                continue
+            entry_row = entry_rows.iloc[0]
+            entry_price = entry_row["open"]
+            if entry_price <= 0:
+                continue
+            ret_pct = (current_price - entry_price) / entry_price * 100
             rows.append({
                 "ticker": ticker,
                 "timeframe": args.timeframe,
                 "cross_date": last_event["date"].strftime("%Y-%m-%d"),
-                "price_at_cross": round(last_event["price"], 3),
+                "signal_close": round(last_event["price"], 3),
+                "entry_date": entry_row["date"].strftime("%Y-%m-%d"),
+                "entry_price": round(entry_price, 3),
                 "adx_at_cross": round(last_event["adx"], 1),
                 "plus_di_at_cross": round(last_event["plus_di"], 1),
                 "minus_di_at_cross": round(last_event["minus_di"], 1),
                 "current_price": round(current_price, 3),
-                "current_adx": round(current_adx, 1) if current_adx else None,
+                "current_adx": round(current_adx, 1) if current_adx is not None else None,
                 "return_pct_since_cross": round(ret_pct, 1),
             })
             print(f"  [{i+1}/{len(tickers)}] {ticker}: CROSS {last_event['date'].date()} @ ${last_event['price']:.2f}, "
@@ -335,7 +393,15 @@ def main(argv=None):
 
     if not rows:
         print("\nNo qualifying crossovers found in this universe/window.")
-        return
+        empty_columns = [
+            "ticker", "timeframe", "cross_date", "signal_close", "entry_date",
+            "entry_price", "adx_at_cross", "plus_di_at_cross",
+            "minus_di_at_cross", "current_price", "current_adx",
+            "return_pct_since_cross",
+        ]
+        pd.DataFrame(columns=empty_columns).to_csv(args.out, index=False)
+        print(f"Empty results written to {args.out}")
+        return 0
 
     out_df = pd.DataFrame(rows).sort_values("return_pct_since_cross", ascending=False)
     out_df.to_csv(args.out, index=False)
@@ -351,7 +417,8 @@ def main(argv=None):
             send_results_email(
                 args.out,
                 args.email_to,
-                args.email_credential,
+                args.email_from,
+                os.environ.get("RESEND_API_KEY"),
                 args.timeframe,
                 len(rows),
             )

@@ -166,11 +166,15 @@ def analyze(ticker):
             continue
         first_date = dates_hit[0]
         first_idx = df.index[df["date"] == first_date][0]
-        price_then = close.iloc[first_idx]
+        entry_idx = first_idx + 1
+        if entry_idx >= len(df):
+            print(f"  {name:35s}: signal awaits next trading bar")
+            continue
+        price_then = df["open"].iloc[entry_idx]
         price_now = close.iloc[-1]
         ret = (price_now - price_then) / price_then * 100
         extra = f" (+{len(dates_hit)-1} more)" if len(dates_hit) > 1 else ""
-        print(f"  {name:35s}: FIRST FIRED {first_date.date()} @ ${price_then:.3f} "
+        print(f"  {name:35s}: FIRST FIRED {first_date.date()}, next-open entry ${price_then:.3f} "
               f"-> now ${price_now:.3f} ({ret:+.1f}%){extra}")
 
 

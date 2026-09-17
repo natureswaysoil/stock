@@ -1,0 +1,27 @@
+name: Test Resend email
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  send-test-email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      STOCK_EMAIL_FROM: Stock Scanner <stocks@natureswaysoil.com>
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Send verification email
+        run: >-
+          python adx_daily_study.py --test-email
+          --out resend_email_test.csv
+          --email-to natureswaysoil@gmail.com
