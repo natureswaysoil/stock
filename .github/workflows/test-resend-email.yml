@@ -26,7 +26,22 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements.txt
       - name: Send verification email
-        run: >-
-          python adx_daily_study.py --test-email
-          --out resend_email_test.csv
-          --email-to natureswaysoil@gmail.com
+        id: send
+        shell: bash
+        run: |
+          output=$(python adx_daily_study.py --test-email \
+            --out resend_email_test.csv \
+            --email-to natureswaysoil@gmail.com)
+          echo "$output"
+          message_id=$(printf '%s' "$output" | sed -n 's/.*message \([^)]*\)).*/\1/p')
+          test -n "$message_id"
+          echo "message_id=$message_id" >> "$GITHUB_OUTPUT"
+      - name: Check Resend delivery status
+        shell: bash
+        run: |
+          sleep 15
+          curl --fail --silent --show-error \
+            --user-agent 'natureswaysoil-stock-scanner/1.0' \
+            --header "Authorization: Bearer $RESEND_API_KEY" \
+            "https://api.resend.com/emails/${{ steps.send.outputs.message_id }}" \
+            | jq '{id, from, to, subject, created_at, last_event}'
