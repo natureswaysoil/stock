@@ -1,0 +1,30 @@
+//@version=6
+indicator("Sub-$2 ADX Pine Screener", shorttitle="ADX Penny Scan", overlay=false)
+
+adxLength = input.int(10, "ADX / DI Length", minval=1)
+adxSmoothing = input.int(10, "ADX Smoothing", minval=1)
+adxThreshold = input.float(20.0, "ADX Cross Threshold", minval=0.0)
+minimumPrice = input.float(0.10, "Minimum Price", minval=0.0)
+maximumPrice = input.float(2.00, "Maximum Price", minval=0.01)
+minimumVolume = input.int(300000, "Minimum Bar Volume", minval=0)
+
+[plusDI, minusDI, adx] = ta.dmi(adxLength, adxSmoothing)
+
+priceQualified = close > minimumPrice and close < maximumPrice
+volumeQualified = volume > minimumVolume
+trendQualified = plusDI > minusDI
+qualifiedSignal = barstate.isconfirmed and ta.crossover(adx, adxThreshold) and trendQualified and priceQualified and volumeQualified
+
+plot(adx, "ADX", color=color.blue)
+plot(plusDI, "+DI", color=color.green)
+plot(minusDI, "-DI", color=color.red)
+plot(close, "Close", display=display.data_window)
+plot(volume, "Volume", display=display.data_window)
+plot(qualifiedSignal ? 1 : 0, "Qualified Signal", color=color.orange, style=plot.style_columns)
+hline(adxThreshold, "ADX Threshold", color=color.gray)
+
+alertcondition(
+     qualifiedSignal,
+     title="Qualified ADX cross",
+     message="Qualified ADX cross. Use the JSON webhook template from TRADINGVIEW_SETUP.md."
+)
